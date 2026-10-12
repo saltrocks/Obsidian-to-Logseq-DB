@@ -225,10 +225,14 @@ pub fn split(export: &Edn, chunk_blocks: usize) -> Vec<Step> {
 
     let prop_batches = batch(prop_updates, PROPERTY_BATCH_SIZE, |(_, u)| u.size());
     let n = prop_batches.len();
+    // Each batch needs a distinct timestamp to actually change the property.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
     for (i, group) in prop_batches.into_iter().enumerate() {
         steps.push(Step {
             label: format!("properties {}/{n}", i + 1),
-            edn: property_batch(group, &property_defs),
+            edn: property_batch(group, &property_defs, now_ms + i as i64 + 1),
         });
     }
     steps
@@ -368,7 +372,11 @@ fn export_map(properties: Vec<(Edn, Edn)>, classes: Vec<(Edn, Edn)>, pages: Vec<
     ])
 }
 
-fn property_batch(updates: Vec<(Uuid, Update)>, property_defs: &[(Edn, Edn)]) -> Edn {
+fn property_batch(
+    updates: Vec<(Uuid, Update)>,
+    property_defs: &[(Edn, Edn)],
+    touch_ms: i64,
+) -> Edn {
     let mut used = BTreeSet::new();
     let mut pages = Vec::new();
     for (page, u) in updates {
@@ -393,11 +401,28 @@ fn property_batch(updates: Vec<(Uuid, Update)>, property_defs: &[(Edn, Edn)]) ->
         }
         pages.push(page_entry(page, attrs, u.blocks));
     }
-    let defs = property_defs
-        .iter()
-        .filter(|(k, _)| used.contains(&k.to_edn_string()))
-        .cloned()
-        .collect();
+    let mut defs = Vec::new();
+    for (key, def) in property_defs {
+        if !used.contains(&key.to_edn_string()) {
+            continue;
+        }
+        let Edn::Map(def) = def else { continue };
+        let mut def = def.clone();
+        remove(&mut def, "build/keep-uuid?");
+        // Touch the property entity so Logseq validates it along with the
+        // batch. With `:validate-scope :tx`, a :many property holding a
+        // single value only validates when the property itself is among the
+        // touched entities; otherwise it fails with "should be a node with a
+        // title" (or the equivalent for other types).
+        if let Some(Edn::Uuid(uuid)) = remove(&mut def, "block/uuid") {
+            pages.push(page_entry(
+                uuid,
+                vec![(Edn::kw("block/updated-at"), Edn::Int(touch_ms))],
+                Vec::new(),
+            ));
+        }
+        defs.push((key.clone(), Edn::Map(def)));
+    }
     export_map(defs, Vec::new(), pages)
 }
 

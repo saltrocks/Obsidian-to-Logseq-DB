@@ -1097,6 +1097,10 @@ impl<'a> Converter<'a> {
                         }),
                     ),
                     (Edn::kw("block/title"), Edn::str(s.title.clone())),
+                    // A known UUID lets later property batches reference the
+                    // property entity (see phases::property_batch).
+                    (Edn::kw("block/uuid"), Edn::Uuid(Uuid::new_v4())),
+                    (Edn::kw("build/keep-uuid?"), Edn::Bool(true)),
                 ]),
             ));
         }

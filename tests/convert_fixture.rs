@@ -176,6 +176,21 @@ fn imports_into_logseq() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["data"]["result"], 5, "{json}");
+    // A list property holding a single page link (applied in a property batch).
+    let out = Command::new("logseq")
+        .args([
+            "query",
+            "--graph",
+            graph,
+            "--output",
+            "json",
+            "--query",
+            "[:find ?t . :where [?p :block/title \"Index (Projects)\"] [?p :user.property/related ?r] [?r :block/title ?t]]",
+        ])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["data"]["result"], "Home", "{json}");
     let _ = Command::new("logseq")
         .args(["graph", "remove", "--graph", graph])
         .status();
