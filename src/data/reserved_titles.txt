@@ -1,0 +1,140 @@
+$$$favorites
+$$$views
+Agent Session ID
+Alias
+Annotation color
+Annotation data
+Annotation image
+Annotation page
+Annotation type
+Apply template to tags
+Asset
+Asset alignment
+Asset resize metadata
+Assignee
+Background color
+Bidirectional property title
+Built in?
+Card
+Cards
+Choice checkbox state
+Choice classes
+Choice exclusions
+Closed value property
+Code
+Code Mode
+Comment
+Commented blocks
+Comments
+Contents
+Created from property
+Deadline
+Default value
+Deleted at
+Deleted by
+Description
+Due
+Enable bidirectional properties
+Enable property history
+Excluded from Graph view?
+Excluded references
+Extends
+External URL
+External file name
+File Size
+File Type
+File checksum
+File remote metadata
+Gallery asset property
+Gallery card height
+Gallery card size
+Gallery card width
+Gallery display properties
+Heading
+Hide empty value
+Hide from Node
+Hide this property or page
+History block
+History property
+History scalar value
+History value
+Icon
+Image height
+Image width
+Included references
+Journal
+Journal date
+Last visit page
+Library
+List type
+Math
+Node Display Type
+Node Repeats?
+Node collapsed?
+Node created at
+Node created by
+Node links to
+Node order
+Node page
+Node parent
+Node references
+Node title
+Node updated at
+Non ref type default value
+PDF Annotation
+Page
+Page Tags
+Priority
+Properties displayed as checkbox
+Property
+Property classes
+Property position
+Property public?
+Property type
+Property value
+Property view context
+Published URL
+Publishing Public?
+Query
+Quick add
+Quote
+Reaction emoji
+Reaction target
+Recycle
+Recycle original order
+Recycle original page
+Recycle original parent
+Reference to large block title stored in remote object storage
+Repeating Checked Property
+Repeating Temporal Property
+Repeating recur frequency
+Repeating recur unit
+Repeating type
+Root Tag
+Scheduled
+State
+Status
+Table view pinned columns
+Tag
+Tag Properties
+Tags
+Task
+Template
+This view belongs to
+Title Format
+Used template
+User Avatar
+User Email
+User Name
+View Feature Type
+View Type
+View columns settings
+View filters
+View group by property
+View hidden columns
+View ordered columns
+View sort groups DESC
+View sort groups by
+View sorting
+Whiteboard
+ls-type
