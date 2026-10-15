@@ -666,6 +666,26 @@ impl<'a> Converter<'a> {
                 ));
                 block.text.clone()
             }
+            // Logseq DB renders `#+BEGIN_QUOTE` as a deprecation warning, so
+            // quote callouts become quote blocks with the title on top.
+            BlockKind::Callout { kind, title } if matches!(kind.as_str(), "quote" | "cite") => {
+                builtin_tags.push("logseq.class/Quote-block");
+                props.push((
+                    Edn::kw("logseq.property.node/display-type"),
+                    Edn::kw("quote"),
+                ));
+                let body = self.render_inline(&block.text, note, &mut tags, true);
+                if title.is_empty() {
+                    body
+                } else {
+                    let title = self.render_inline(title, note, &mut tags, true);
+                    if body.is_empty() {
+                        format!("**{title}**")
+                    } else {
+                        format!("**{title}**\n{body}")
+                    }
+                }
+            }
             BlockKind::Callout { kind, title } => {
                 let (admonition, default_title) = callout_admonition(kind);
                 let title = if title.is_empty() {
@@ -1272,7 +1292,6 @@ fn callout_admonition(kind: &str) -> (&'static str, Option<&'static str>) {
         "danger" | "error" => ("CAUTION", Some("Danger")),
         "failure" | "fail" | "missing" => ("CAUTION", Some("Failure")),
         "bug" => ("CAUTION", Some("Bug")),
-        "quote" | "cite" => ("QUOTE", None),
         "abstract" | "summary" | "tldr" => ("NOTE", Some("Summary")),
         "info" => ("NOTE", Some("Info")),
         "todo" => ("NOTE", Some("Todo")),

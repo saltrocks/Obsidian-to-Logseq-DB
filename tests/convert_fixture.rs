@@ -51,6 +51,7 @@ fn converts_sample_vault() {
     assert!(edn.contains("Issue #42 is not a tag."));
     assert!(!edn.contains("hidden comment"));
     assert!(edn.contains("^^highlight^^"));
+    assert!(!edn.contains("#+BEGIN_QUOTE"));
 
     // Logseq node types.
     for needle in [
@@ -64,6 +65,7 @@ fn converts_sample_vault() {
         ":logseq.property.node/display-type :quote",
         ":logseq.property.node/display-type :math",
         "#+BEGIN_WARNING\\n**Be careful**",
+        "\"**Ada Lovelace**\\nQuoted callout body\"",
         ":block/link [:block/uuid",
         ":logseq.property.asset/type \"png\"",
         ":logseq.property.asset/type \"pdf\"",

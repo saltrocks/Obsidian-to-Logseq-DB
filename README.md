@@ -64,8 +64,8 @@ Options:
 | `#tag`, `#nested/tag`, frontmatter `tags` | Logseq tag (class). A note with the same name becomes the tag's page |
 | Frontmatter properties | Properties; type inferred per key (text, number, checkbox, url, date, node) |
 | Frontmatter `aliases` | Page aliases |
-| Callouts `> [!tip] Title` | `#+BEGIN_TIP` admonition (note, tip, important, warning, caution, quote) |
-| Block quote | `#Quote` block |
+| Callouts `> [!tip] Title` | `#+BEGIN_TIP` admonition (note, tip, important, warning, caution) |
+| Block quote, `> [!quote]` callout | `#Quote` block |
 | Code fence | `#Code` block with language |
 | `$$math$$` | `#Math` block |
 | `==highlight==` | `^^highlight^^` |

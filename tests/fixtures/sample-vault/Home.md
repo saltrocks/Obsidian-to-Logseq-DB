@@ -47,6 +47,9 @@ Remote image ![logo](https://example.com/logo.png) stays.
 > A plain quote
 > spanning lines
 
+> [!quote] Ada Lovelace
+> Quoted callout body
+
 ```rust
 fn main() { println!("#not-a-tag [[nope]]"); }
 ```
