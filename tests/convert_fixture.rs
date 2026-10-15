@@ -98,7 +98,7 @@ fn converts_sample_vault() {
         ":logseq.property.asset/type \"png\"",
         ":logseq.property.asset/type \"pdf\"",
         ":block/alias #{[:block/uuid",
-        "{{video https://www.youtube.com/watch?v=1adNxqAtYMQ}}",
+        "{{youtube https://www.youtube.com/watch?v=1adNxqAtYMQ}}",
         "![logo](https://example.com/logo.png)",
     ] {
         assert!(edn.contains(needle), "missing {needle}");

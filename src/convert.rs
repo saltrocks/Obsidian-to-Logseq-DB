@@ -1687,7 +1687,7 @@ fn escape_label(label: &str) -> String {
 }
 
 /// Obsidian embeds YouTube videos and tweets with image syntax
-/// (`![](https://youtu.be/…)`); Logseq uses `{{video …}}` / `{{tweet …}}`.
+/// (`![](https://youtu.be/…)`); Logseq uses `{{youtube …}}` / `{{tweet …}}`.
 fn web_embed(url: &str) -> Option<String> {
     let lower = url.to_ascii_lowercase();
     let rest = lower
@@ -1699,7 +1699,9 @@ fn web_embed(url: &str) -> Option<String> {
         .or_else(|| host.strip_prefix("m."))
         .unwrap_or(host);
     match host {
-        "youtube.com" | "youtu.be" | "youtube-nocookie.com" => Some(format!("{{{{video {url}}}}}")),
+        "youtube.com" | "youtu.be" | "youtube-nocookie.com" => {
+            Some(format!("{{{{youtube {url}}}}}"))
+        }
         "twitter.com" | "x.com" if path.contains("/status/") => {
             Some(format!("{{{{tweet {url}}}}}"))
         }
@@ -2089,10 +2091,10 @@ mod tests {
     #[test]
     fn web_embeds() {
         let yt = "https://www.youtube.com/watch?v=1adNxqAtYMQ";
-        assert_eq!(web_embed(yt), Some(format!("{{{{video {yt}}}}}")));
+        assert_eq!(web_embed(yt), Some(format!("{{{{youtube {yt}}}}}")));
         assert_eq!(
             web_embed("https://youtu.be/1adNxqAtYMQ").as_deref(),
-            Some("{{video https://youtu.be/1adNxqAtYMQ}}")
+            Some("{{youtube https://youtu.be/1adNxqAtYMQ}}")
         );
         assert_eq!(
             web_embed("https://x.com/obsdmd/status/123").as_deref(),
