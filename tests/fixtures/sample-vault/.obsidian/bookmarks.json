@@ -1,0 +1,9 @@
+{
+  "items": [
+    {"type": "file", "ctime": 1, "path": "Home.md"},
+    {"type": "group", "ctime": 2, "title": "Work", "items": [
+      {"type": "heading", "ctime": 3, "path": "Projects/Alpha/Project Alpha.md", "subpath": "#Goals"},
+      {"type": "search", "ctime": 4, "query": "tag:#hub"}
+    ]}
+  ]
+}

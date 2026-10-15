@@ -30,12 +30,21 @@ fn convert_fixture(opts: impl FnOnce(&mut ConvertOptions)) -> (Conversion, Strin
 fn converts_sample_vault() {
     let (conv, edn) = convert_fixture(|_| {});
     let s = &conv.stats;
-    assert_eq!(s.notes, 9);
+    assert_eq!(s.notes, 10);
     assert_eq!(s.journals, 2, "daily note plus the date property target");
     assert_eq!(s.assets, 2);
     assert_eq!(s.placeholder_pages, 1, "[[Missing Note]]");
     assert_eq!(s.alias_pages, 1, "Start here");
-    assert_eq!(conv.warnings.len(), 1, "{:?}", conv.warnings);
+    assert_eq!(s.templates, 1);
+    assert_eq!(s.favorites, 2, "Home and the note of a bookmarked heading");
+    assert_eq!(conv.warnings.len(), 2, "{:?}", conv.warnings);
+    assert!(
+        conv.warnings
+            .iter()
+            .any(|w| w.starts_with("search bookmark")),
+        "{:?}",
+        conv.warnings
+    );
 
     // Pages, renamed collisions and journals.
     assert!(edn.contains(":block/title \"Task (Obsidian)\""));
@@ -66,6 +75,25 @@ fn converts_sample_vault() {
         ":logseq.property.node/display-type :math",
         "#+BEGIN_WARNING\\n**Be careful**",
         "\"**Ada Lovelace**\\nQuoted callout body\"",
+        "#+BEGIN_NOTE\\n**Recipe**\\nCustom callout body",
+        "#+BEGIN_NOTE\\n**Folded info**\\n#+END_NOTE",
+        ":block/collapsed? true",
+        ":logseq.property.asset/resize-metadata {:width 300}",
+        // Tasks plugin repeat and dates.
+        ":logseq.property.repeat/temporal-property :logseq.property/deadline",
+        ":logseq.property.repeat/repeat-type :logseq.property.repeat/repeat-type.dotted-plus",
+        ":logseq.property.repeat/recur-frequency 2",
+        ":logseq.property.repeat/recur-unit :logseq.property.repeat/recur-unit.week",
+        ":user.property/start-date {:logseq.property/type :datetime",
+        ":user.property/done-date {:logseq.property/type :datetime",
+        // Footnote definitions join the block that references them.
+        "Claim with a source[^1] and an aside[^2].\\n\\n[^1]: The cited source.\\n\\n[^2]: Inline footnote text\"",
+        // Templates and favorites.
+        ":block/title \"Meeting\"",
+        ":build/tags [:logseq.class/Template]",
+        ":block/title \"<% current page %>\"",
+        "Created <% today %> at <% time %>",
+        ":block/title \"$$$favorites\"",
         ":block/link [:block/uuid",
         ":logseq.property.asset/type \"png\"",
         ":logseq.property.asset/type \"pdf\"",
@@ -83,6 +111,7 @@ fn converts_sample_vault() {
         ("website", "url"),
         ("related", "node"),
         ("due", "date"),
+        ("meeting", "datetime"),
         ("status", "default"),
     ] {
         assert!(
@@ -98,7 +127,10 @@ fn converts_sample_vault() {
 
     // Tags become classes; the note named like a tag becomes the tag's page.
     assert!(edn.contains(":user.class/hub {:block/title \"hub\""));
-    assert!(edn.contains(":user.class/area-work {:block/title \"area/work\""));
+    // Nested tags become a tag hierarchy.
+    assert!(edn.contains(":user.class/area-work {:block/title \"work\""));
+    assert!(edn.contains(":build/class-extends [:user.class/area]"));
+    assert!(edn.contains(":user.class/area {:block/title \"area\""));
 }
 
 #[test]

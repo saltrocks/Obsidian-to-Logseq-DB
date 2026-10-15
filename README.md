@@ -56,21 +56,29 @@ Options:
 | Heading | Block with the heading property |
 | `- [ ]`, `- [x]`, `- [/]`, `- [-]` | `#Task` with status Todo / Done / Doing / Canceled |
 | Tasks plugin `📅` `⏳` `⏫🔼🔽🔺` | Deadline, scheduled, priority |
+| Tasks plugin `🔁 every 2 weeks [when done]` | Repeating task (only with a `📅` or `⏳` date; rules naming weekdays or dates stay text) |
+| Tasks plugin `🛫` `✅` `❌` / `➕` | *Start date*, *Done date*, *Cancelled date* properties / block creation time |
 | Numbered list | Blocks with the numbered list type |
 | `[[Note]]`, `[[Note\|text]]`, `[text](Note.md)` | Page reference, with label when given |
 | `[[Note#Heading]]`, `[[Note#^id]]`, `^id` | Block reference to the heading or block |
 | `![[Note]]`, `![[Note#Heading]]` on its own line | Embedded page / block |
 | `![[image.png]]`, `![](image.png)`, `[[file.pdf]]` | `#Asset` stored in the graph's `assets/` folder |
-| `#tag`, `#nested/tag`, frontmatter `tags` | Logseq tag (class). A note with the same name becomes the tag's page |
-| Frontmatter properties | Properties; type inferred per key (text, number, checkbox, url, date, node) |
+| `![[image.png\|300]]`, `![alt\|300](image.png)` | Image width (the first size given for an image wins) |
+| `#tag`, frontmatter `tags` | Logseq tag (class). A note with the same name becomes the tag's page |
+| `#nested/tag` | Tag `tag` extending tag `nested` |
+| Frontmatter properties | Properties; type inferred per key (text, number, checkbox, url, date, date & time, node) |
 | Frontmatter `aliases` | Page aliases |
-| Callouts `> [!tip] Title` | `#+BEGIN_TIP` admonition (note, tip, important, warning, caution) |
+| Callouts `> [!tip] Title` | `#+BEGIN_TIP` admonition (note, tip, important, warning, caution); other types keep their name as the title |
+| Folded callouts `> [!tip]- Title` | Admonition with the title, body in a collapsed child block |
 | Block quote, `> [!quote]` callout | `#Quote` block |
 | Code fence | `#Code` block with language |
 | `$$math$$` | `#Math` block |
 | `==highlight==` | `^^highlight^^` |
+| Footnotes `[^1]`, `^[inline]` | Definitions are added to the blocks that reference them |
 | `%%comment%%` | Removed (unless `--keep-comments`) |
 | Links to missing notes | Empty page, like Obsidian creates on click |
+| Notes in the templates folder | Page with a `#Template` block; `{{date}}`, `{{time}}`, `{{title}}` become `<% today %>`, `<% time %>`, `<% current page %>` |
+| Bookmarks | Favorites (a bookmarked heading or block favorites its note; folder, search and URL bookmarks are skipped) |
 
 Note and page timestamps come from the files' creation and modification times.
 
@@ -78,6 +86,10 @@ Notes whose names collide with Logseq built-in pages (e.g. `Task`, `Tags`,
 `Contents`) are renamed to `Task (Obsidian)`, since importing them under the
 same name would merge them into the built-in page. Attachments that no note
 links to are skipped.
+
+Not converted, as Logseq DB has no equivalent: a numbered list's start
+number, `![[Note]]` embeds inside a sentence (they become references), folders,
+Canvas and Bases files, and plugin syntax such as Dataview queries.
 
 ## How importing works
 

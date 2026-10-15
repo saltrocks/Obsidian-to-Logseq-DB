@@ -9,8 +9,9 @@
 //! 2. blocks in chunks of whole pages,
 //! 3. fix-ups for blocks that link to blocks of a later chunk (a reference
 //!    to a block that doesn't exist yet fails validation),
-//! 4. properties whose values become entities (user properties and numbered
-//!    list markers), in small batches against the existing nodes.
+//! 4. properties whose values become entities (user properties, numbered
+//!    list markers and repeat frequencies), in small batches against the
+//!    existing nodes.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -28,9 +29,15 @@ pub struct Step {
     pub edn: Edn,
 }
 
+/// Built-in properties whose values become entities.
+const DEFERRED_BUILT_INS: [&str; 2] = [
+    "logseq.property/order-list-type",
+    "logseq.property.repeat/recur-frequency",
+];
+
 fn deferred_property(key: &Edn) -> bool {
     matches!(key, Edn::Keyword(k)
-        if k.starts_with("user.property/") || k == "logseq.property/order-list-type")
+        if k.starts_with("user.property/") || DEFERRED_BUILT_INS.contains(&k.as_str()))
 }
 
 fn get<'a>(map: &'a [(Edn, Edn)], key: &str) -> Option<&'a Edn> {

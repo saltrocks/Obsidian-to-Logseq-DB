@@ -9,10 +9,17 @@
 pub enum BlockKind {
     Text,
     Heading(u8),
-    Code { lang: Option<String> },
+    Code {
+        lang: Option<String>,
+    },
     Quote,
     Math,
-    Callout { kind: String, title: String },
+    /// `folded` is set for callouts that start collapsed (`[!tip]-`).
+    Callout {
+        kind: String,
+        title: String,
+        folded: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -472,9 +479,14 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let block = match parse_callout_header(content.first().map(String::as_str).unwrap_or("")) {
-            Some((kind, title)) => {
-                MdBlock::new(BlockKind::Callout { kind, title }, content[1..].join("\n"))
-            }
+            Some((kind, title, folded)) => MdBlock::new(
+                BlockKind::Callout {
+                    kind,
+                    title,
+                    folded,
+                },
+                content[1..].join("\n"),
+            ),
             None => MdBlock::new(BlockKind::Quote, content.join("\n")),
         };
         self.add(parent, block);
@@ -581,7 +593,8 @@ fn parse_heading(rest: &str) -> Option<(u8, String)> {
     Some((level as u8, text.to_string()))
 }
 
-fn parse_callout_header(first: &str) -> Option<(String, String)> {
+/// Returns (kind, title, folded) for a `[!kind]± title` line.
+fn parse_callout_header(first: &str) -> Option<(String, String, bool)> {
     let rest = first.trim_start().strip_prefix("[!")?;
     let end = rest.find(']')?;
     let kind = rest[..end].trim().to_lowercase();
@@ -589,11 +602,12 @@ fn parse_callout_header(first: &str) -> Option<(String, String)> {
         return None;
     }
     let after = &rest[end + 1..];
+    let folded = after.starts_with('-');
     let after = after
         .strip_prefix('+')
         .or_else(|| after.strip_prefix('-'))
         .unwrap_or(after);
-    Some((kind, after.trim().to_string()))
+    Some((kind, after.trim().to_string(), folded))
 }
 
 fn is_hr(rest: &str) -> bool {
@@ -791,7 +805,8 @@ mod tests {
             blocks[0].kind,
             BlockKind::Callout {
                 kind: "tip".into(),
-                title: "Title here".into()
+                title: "Title here".into(),
+                folded: true,
             }
         );
         assert_eq!(blocks[0].text, "body line\nmore");

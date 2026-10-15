@@ -40,6 +40,15 @@ pub struct DailyConfig {
     pub folder: String,
 }
 
+/// An entry of `.obsidian/bookmarks.json`, with groups flattened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bookmark {
+    /// A note, or a heading or block in it (bookmarked as the whole note).
+    File { path: String },
+    /// Folders, searches, URLs and graph views have no Logseq favorite.
+    Other { kind: String, title: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Note(usize),
@@ -52,6 +61,9 @@ pub struct Vault {
     pub notes: Vec<Note>,
     pub attachments: Vec<Attachment>,
     pub daily: Option<DailyConfig>,
+    /// Folder of the core Templates plugin (`.obsidian/templates.json`).
+    pub templates_folder: Option<String>,
+    pub bookmarks: Vec<Bookmark>,
     notes_by_stem: HashMap<String, Vec<usize>>,
     notes_by_path: HashMap<String, usize>,
     atts_by_name: HashMap<String, Vec<usize>>,
@@ -128,7 +140,35 @@ impl Vault {
             }
         }
         vault.build_indexes();
+        vault.load_obsidian_config();
         Ok(vault)
+    }
+
+    /// Reads the templates folder and bookmarks; missing or invalid files
+    /// are ignored like Obsidian does.
+    fn load_obsidian_config(&mut self) {
+        let read = |name: &str| -> serde_json::Value {
+            fs::read_to_string(self.root.join(".obsidian").join(name))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        self.templates_folder = read("templates.json")["folder"]
+            .as_str()
+            .map(|f| f.trim_matches('/').to_string())
+            .filter(|f| !f.is_empty());
+        let mut bookmarks = Vec::new();
+        collect_bookmarks(&read("bookmarks.json")["items"], &mut bookmarks);
+        self.bookmarks = bookmarks;
+    }
+
+    /// Whether the note is in the templates folder.
+    pub fn is_template(&self, note: &Note) -> bool {
+        self.templates_folder.as_ref().is_some_and(|f| {
+            let folder = note.folder.to_lowercase();
+            let f = f.to_lowercase();
+            folder == f || folder.starts_with(&format!("{f}/"))
+        })
     }
 
     fn build_indexes(&mut self) {
@@ -293,6 +333,33 @@ impl Vault {
                 )
             })
             .expect("candidate lists are never empty")
+    }
+}
+
+fn collect_bookmarks(items: &serde_json::Value, out: &mut Vec<Bookmark>) {
+    for item in items.as_array().into_iter().flatten() {
+        let kind = item["type"].as_str().unwrap_or("");
+        match kind {
+            "group" => collect_bookmarks(&item["items"], out),
+            "file" | "heading" | "block" => {
+                if let Some(path) = item["path"].as_str() {
+                    out.push(Bookmark::File {
+                        path: path.to_string(),
+                    });
+                }
+            }
+            _ => {
+                let title = ["title", "path", "query", "url"]
+                    .iter()
+                    .find_map(|k| item[*k].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.push(Bookmark::Other {
+                    kind: kind.to_string(),
+                    title,
+                });
+            }
+        }
     }
 }
 

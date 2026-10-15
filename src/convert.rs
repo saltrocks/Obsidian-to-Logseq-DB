@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use yaml_serde::Value;
@@ -19,7 +19,7 @@ use crate::markdown::{BlockKind, MdBlock, ParseOptions, code_span_len, parse_not
 use crate::properties::{
     self, ALIAS_KEYS, DROPPED_KEYS, PropSchema, PropType, SchemaBuilder, TAG_KEYS,
 };
-use crate::vault::{Target, Vault};
+use crate::vault::{Bookmark, Target, Vault};
 
 /// Titles of the pages in a freshly created Logseq DB graph, used when the
 /// target graph can't be queried.
@@ -33,6 +33,8 @@ pub fn bundled_reserved_titles() -> HashSet<String> {
 
 /// Title of Logseq's built-in page that holds `#Asset` blocks.
 const ASSET_PAGE_TITLE: &str = "Asset";
+/// Title of Logseq's hidden page whose blocks link to the favorites.
+const FAVORITES_PAGE_TITLE: &str = "$$$favorites";
 
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -65,6 +67,8 @@ pub struct Stats {
     pub blocks: usize,
     pub assets: usize,
     pub unreferenced_attachments: usize,
+    pub templates: usize,
+    pub favorites: usize,
 }
 
 pub struct Conversion {
@@ -83,6 +87,8 @@ struct Entity {
     notes: Vec<usize>,
     journal: Option<NaiveDate>,
     class_ident: Option<String>,
+    /// Parent tag of a nested tag (`#parent/child`).
+    class_extends: Option<usize>,
     alias_of: Option<usize>,
     aliases: Vec<usize>,
     blocks: Vec<Edn>,
@@ -93,6 +99,8 @@ struct Entity {
 struct Asset {
     uuid: Uuid,
     attachment: usize,
+    /// Display width from an embed like `![[img.png|300]]`.
+    width: Option<i64>,
 }
 
 struct Converter<'a> {
@@ -113,6 +121,7 @@ struct Converter<'a> {
     used_props: BTreeSet<String>,
     warnings: Vec<String>,
     block_count: usize,
+    template_count: usize,
 }
 
 struct ParsedFile {
@@ -138,9 +147,11 @@ pub fn convert(vault: &Vault, opts: &ConvertOptions) -> Result<Conversion> {
         used_props: BTreeSet::new(),
         warnings: Vec::new(),
         block_count: 0,
+        template_count: 0,
     };
     let mut parsed = conv.parse_notes()?;
     for (i, file) in parsed.iter_mut().enumerate() {
+        attach_footnotes(&mut file.blocks);
         conv.assign_block_uuids(i, &mut file.blocks);
     }
     conv.build_schemas(&parsed);
@@ -166,6 +177,11 @@ impl<'a> Converter<'a> {
         for note in &self.vault.notes {
             let bytes = fs::read(&note.abs_path)?;
             let source = String::from_utf8_lossy(&bytes);
+            let source = if self.vault.is_template(note) {
+                std::borrow::Cow::Owned(template_variables(&source))
+            } else {
+                source
+            };
             let parsed = parse_note(&source, parse_opts);
             let mut frontmatter = Vec::new();
             if let Some(yaml) = parsed
@@ -234,6 +250,9 @@ impl<'a> Converter<'a> {
                 }
                 builder.observe(key, value);
             }
+        }
+        for file in parsed {
+            observe_task_dates(&file.blocks, &mut builder);
         }
         self.schemas = builder.build();
     }
@@ -383,7 +402,14 @@ impl<'a> Converter<'a> {
     /// Class entity for an Obsidian tag. Notes or dangling pages with the same
     /// name become the tag's page, matching Logseq where tags are pages.
     fn class_for_tag(&mut self, tag: &str) -> usize {
+        let tag = tag.trim_matches('/');
         let lower = tag.to_lowercase();
+        if let Some((parent, leaf)) = tag.rsplit_once('/')
+            && !parent.is_empty()
+            && !leaf.is_empty()
+        {
+            return self.nested_class(tag, parent, leaf);
+        }
         if let Some(&e) = self.by_name.get(&lower) {
             let ent = &self.entities[e];
             if ent.class_ident.is_some() {
@@ -404,6 +430,26 @@ impl<'a> Converter<'a> {
         e
     }
 
+    /// Logseq has no `/` namespaces for tags: `#area/work` becomes the tag
+    /// `work` extending the tag `area`, as Logseq's own importer does. Tags
+    /// may share a title when their parents differ, so the leaf title isn't
+    /// claimed.
+    fn nested_class(&mut self, tag: &str, parent: &str, leaf: &str) -> usize {
+        let lower = tag.to_lowercase();
+        if let Some(&e) = self.by_name.get(&lower)
+            && self.entities[e].class_ident.is_some()
+        {
+            return e;
+        }
+        let parent = self.class_for_tag(parent);
+        let ident = properties::unique_ident("user.class", tag, &mut self.class_idents);
+        let e = self.new_entity(leaf.to_string());
+        self.entities[e].class_ident = Some(ident);
+        self.entities[e].class_extends = Some(parent);
+        self.by_name.entry(lower).or_insert(e);
+        e
+    }
+
     fn new_class(&mut self, title: String) -> usize {
         let ident = properties::unique_ident("user.class", &title, &mut self.class_idents);
         let e = self.new_entity(title);
@@ -419,7 +465,11 @@ impl<'a> Converter<'a> {
             return None;
         }
         let uuid = Uuid::new_v4();
-        self.assets.push(Asset { uuid, attachment });
+        self.assets.push(Asset {
+            uuid,
+            attachment,
+            width: None,
+        });
         self.asset_by_attachment
             .insert(attachment, self.assets.len() - 1);
         Some(uuid)
@@ -496,7 +546,28 @@ impl<'a> Converter<'a> {
             .iter()
             .filter_map(|b| self.render_block(b, note, (created, modified)))
             .collect();
-        self.entities[e].blocks.extend(blocks);
+        if self.vault.is_template(&self.vault.notes[note]) && !blocks.is_empty() {
+            // A Logseq template is a #Template block whose children are
+            // inserted; its title is the template's name.
+            self.template_count += 1;
+            self.block_count += 1;
+            let template = Edn::Map(vec![
+                (
+                    Edn::kw("block/title"),
+                    Edn::str(self.vault.notes[note].stem.clone()),
+                ),
+                (Edn::kw("block/created-at"), Edn::Int(created)),
+                (Edn::kw("block/updated-at"), Edn::Int(modified)),
+                (
+                    Edn::kw("build/tags"),
+                    Edn::Vector(vec![Edn::kw("logseq.class/Template")]),
+                ),
+                (Edn::kw("build/children"), Edn::Vector(blocks)),
+            ]);
+            self.entities[e].blocks.push(template);
+        } else {
+            self.entities[e].blocks.extend(blocks);
+        }
     }
 
     fn render_frontmatter(&mut self, note: usize, e: usize, fm: &[(String, Value)]) {
@@ -589,6 +660,13 @@ impl<'a> Converter<'a> {
                 let j = self.journal_for(date);
                 Some(Edn::uuid_ref(self.entities[j].uuid))
             }
+            PropType::DateTime => {
+                let s = properties::scalar_string(value)?;
+                let dt = properties::parse_iso_datetime(&s).or_else(|| {
+                    properties::parse_iso_date(&s).and_then(|d| d.and_hms_opt(0, 0, 0))
+                })?;
+                Some(Edn::Int(local_ms(dt)))
+            }
             PropType::Node => {
                 let s = properties::scalar_string(value)?;
                 let inner = properties::single_wikilink(&s).unwrap_or(s.trim());
@@ -604,6 +682,9 @@ impl<'a> Converter<'a> {
         let mut builtin_tags: Vec<&str> = Vec::new();
         let mut props: Vec<(Edn, Edn)> = Vec::new();
         let mut extra: Vec<(Edn, Edn)> = Vec::new();
+        let mut created_at = ts.0;
+        // Body of a folded callout, imported as a collapsed child block.
+        let mut folded_body: Option<String> = None;
         let title = match &block.kind {
             BlockKind::Text => {
                 if let Some((uuid, _)) = self.standalone_embed(&block.text, note) {
@@ -630,6 +711,47 @@ impl<'a> Converter<'a> {
                                 Edn::kw("logseq.property/scheduled"),
                                 Edn::Int(local_midnight_ms(d)),
                             ));
+                        }
+                        if let Some(r) = &meta.recurrence {
+                            let temporal = if meta.deadline.is_some() {
+                                "logseq.property/deadline"
+                            } else {
+                                "logseq.property/scheduled"
+                            };
+                            let repeat_type = if r.when_done {
+                                "logseq.property.repeat/repeat-type.dotted-plus"
+                            } else {
+                                "logseq.property.repeat/repeat-type.plus"
+                            };
+                            props.extend([
+                                (Edn::kw("logseq.property.repeat/repeated?"), Edn::Bool(true)),
+                                (
+                                    Edn::kw("logseq.property.repeat/temporal-property"),
+                                    Edn::kw(temporal),
+                                ),
+                                (
+                                    Edn::kw("logseq.property.repeat/repeat-type"),
+                                    Edn::kw(repeat_type),
+                                ),
+                                (
+                                    Edn::kw("logseq.property.repeat/recur-frequency"),
+                                    Edn::Int(r.frequency),
+                                ),
+                                (
+                                    Edn::kw("logseq.property.repeat/recur-unit"),
+                                    Edn::kw(r.unit),
+                                ),
+                            ]);
+                        }
+                        if let Some(d) = meta.created {
+                            created_at = local_midnight_ms(d);
+                        }
+                        for (i, (_, prop)) in TASK_DATE_PROPS.iter().enumerate() {
+                            if let Some(d) = meta.other_dates[i]
+                                && let Some(p) = self.task_date_property(prop, d)
+                            {
+                                props.push(p);
+                            }
                         }
                     }
                     text
@@ -668,7 +790,11 @@ impl<'a> Converter<'a> {
             }
             // Logseq DB renders `#+BEGIN_QUOTE` as a deprecation warning, so
             // quote callouts become quote blocks with the title on top.
-            BlockKind::Callout { kind, title } if matches!(kind.as_str(), "quote" | "cite") => {
+            BlockKind::Callout {
+                kind,
+                title,
+                folded,
+            } if matches!(kind.as_str(), "quote" | "cite") => {
                 builtin_tags.push("logseq.class/Quote-block");
                 props.push((
                     Edn::kw("logseq.property.node/display-type"),
@@ -681,19 +807,34 @@ impl<'a> Converter<'a> {
                     let title = self.render_inline(title, note, &mut tags, true);
                     if body.is_empty() {
                         format!("**{title}**")
+                    } else if *folded {
+                        folded_body = Some(body);
+                        format!("**{title}**")
                     } else {
                         format!("**{title}**\n{body}")
                     }
                 }
             }
-            BlockKind::Callout { kind, title } => {
+            BlockKind::Callout {
+                kind,
+                title,
+                folded,
+            } => {
                 let (admonition, default_title) = callout_admonition(kind);
-                let title = if title.is_empty() {
-                    default_title.map(str::to_string).unwrap_or_default()
-                } else {
+                let mut body = self.render_inline(&block.text, note, &mut tags, true);
+                if *folded && !body.is_empty() {
+                    folded_body = Some(std::mem::take(&mut body));
+                }
+                let title = if !title.is_empty() {
                     self.render_inline(title, note, &mut tags, true)
+                } else if let Some(t) = default_title {
+                    t
+                } else if folded_body.is_some() {
+                    // A folded callout shows only its title.
+                    capitalize(kind)
+                } else {
+                    String::new()
                 };
-                let body = self.render_inline(&block.text, note, &mut tags, true);
                 let mut s = format!("#+BEGIN_{admonition}\n");
                 if !title.is_empty() {
                     s.push_str(&format!("**{title}**\n"));
@@ -712,11 +853,22 @@ impl<'a> Converter<'a> {
                 Edn::str("number"),
             ));
         }
-        let children: Vec<Edn> = block
-            .children
-            .iter()
-            .filter_map(|c| self.render_block(c, note, ts))
-            .collect();
+        let mut children: Vec<Edn> = Vec::new();
+        let collapsed = folded_body.is_some();
+        if let Some(body) = folded_body {
+            self.block_count += 1;
+            children.push(Edn::Map(vec![
+                (Edn::kw("block/title"), Edn::Str(body)),
+                (Edn::kw("block/created-at"), Edn::Int(ts.0)),
+                (Edn::kw("block/updated-at"), Edn::Int(ts.1)),
+            ]));
+        }
+        children.extend(
+            block
+                .children
+                .iter()
+                .filter_map(|c| self.render_block(c, note, ts)),
+        );
         let has_link = !extra.is_empty();
         if title.trim().is_empty() && children.is_empty() && !has_link && block.task.is_none() {
             return None;
@@ -728,8 +880,11 @@ impl<'a> Converter<'a> {
             m.push((Edn::kw("block/uuid"), Edn::Uuid(uuid)));
             m.push((Edn::kw("build/keep-uuid?"), Edn::Bool(true)));
         }
-        m.push((Edn::kw("block/created-at"), Edn::Int(ts.0)));
-        m.push((Edn::kw("block/updated-at"), Edn::Int(ts.1)));
+        m.push((Edn::kw("block/created-at"), Edn::Int(created_at)));
+        m.push((Edn::kw("block/updated-at"), Edn::Int(ts.1.max(created_at))));
+        if collapsed {
+            m.push((Edn::kw("block/collapsed?"), Edn::Bool(true)));
+        }
         let mut tag_kws: Vec<Edn> = builtin_tags.into_iter().map(Edn::kw).collect();
         for t in tags {
             if let Some(ident) = &self.entities[t].class_ident {
@@ -748,6 +903,28 @@ impl<'a> Converter<'a> {
             m.push((Edn::kw("build/children"), Edn::Vector(children)));
         }
         Some(Edn::Map(m))
+    }
+
+    /// A Tasks plugin date stored in the user property titled `prop`.
+    fn task_date_property(&mut self, prop: &str, date: NaiveDate) -> Option<(Edn, Edn)> {
+        let key = prop.to_lowercase();
+        let schema = self.schemas.get(&key)?.clone();
+        let value = match schema.ptype {
+            PropType::DateTime => Edn::Int(local_midnight_ms(date)),
+            PropType::Date => {
+                let j = self.journal_for(date);
+                Edn::uuid_ref(self.entities[j].uuid)
+            }
+            PropType::Default => Edn::Str(date.format("%Y-%m-%d").to_string()),
+            _ => return None,
+        };
+        self.used_props.insert(key);
+        let value = if schema.many {
+            Edn::Set(vec![value])
+        } else {
+            value
+        };
+        Some((Edn::kw(schema.ident), value))
     }
 
     /// A paragraph consisting only of `![[note]]` becomes an embed block.
@@ -883,6 +1060,9 @@ impl<'a> Converter<'a> {
     fn render_wikilink(&mut self, inner: &str, note: usize, embed: bool) -> String {
         let (target, sub, label) = split_wikilink(inner);
         // In embeds the part after `|` is a size (`![[img.png|300]]`).
+        if embed && let Some(width) = label.as_deref().and_then(embed_width) {
+            self.set_asset_width(&target, note, width);
+        }
         let label = if embed { None } else { label };
         match self.resolve_link(&target, sub.as_deref(), note, true) {
             Some((uuid, alias_label)) => match label.or(alias_label) {
@@ -893,6 +1073,17 @@ impl<'a> Converter<'a> {
                 let prefix = if embed { "!" } else { "" };
                 format!("{prefix}[[{inner}]]")
             }
+        }
+    }
+
+    /// Records an embed width on the asset. An asset is one block shared by
+    /// all its embeds, so the first width wins.
+    fn set_asset_width(&mut self, target: &str, note: usize, width: i64) {
+        if let Some(Target::Attachment(a)) = self.vault.resolve(target, Some(note))
+            && self.asset_for(a).is_some()
+        {
+            let asset = &mut self.assets[self.asset_by_attachment[&a]];
+            asset.width.get_or_insert(width);
         }
     }
 
@@ -912,6 +1103,13 @@ impl<'a> Converter<'a> {
             Some((p, f)) => (p.to_string(), Some(f.to_string())),
             None => (decoded, None),
         };
+        // Obsidian sizes markdown images with `![alt|300](img.png)`.
+        if image
+            && let Some((_, size)) = link.label.rsplit_once('|')
+            && let Some(width) = embed_width(size)
+        {
+            self.set_asset_width(&path, note, width);
+        }
         match self.vault.resolve(&path, Some(note)) {
             Some(Target::Attachment(a)) => match self.asset_for(a) {
                 Some(uuid) if image => format!("[[{uuid}]]"),
@@ -939,8 +1137,11 @@ impl<'a> Converter<'a> {
         let mut stats = Stats {
             notes: self.vault.notes.len(),
             blocks: self.block_count,
+            templates: self.template_count,
             ..Default::default()
         };
+        let favorites = self.favorites();
+        stats.favorites = favorites.len();
         let mut pages = Vec::new();
         let mut classes = Vec::new();
         let mut sample_page_uuids = Vec::new();
@@ -972,6 +1173,14 @@ impl<'a> Converter<'a> {
                 }
                 if !props.is_empty() {
                     c.push((Edn::kw("build/properties"), Edn::Map(props)));
+                }
+                if let Some(parent) = ent.class_extends
+                    && let Some(parent_ident) = &entities[parent].class_ident
+                {
+                    c.push((
+                        Edn::kw("build/class-extends"),
+                        Edn::Vector(vec![Edn::kw(parent_ident.clone())]),
+                    ));
                 }
                 if !ent.tags.is_empty() || !ent.aliases.is_empty() {
                     self.warnings.push(format!(
@@ -1055,6 +1264,26 @@ impl<'a> Converter<'a> {
                 }
             };
             let checksum = hex(&Sha256::digest(&data));
+            let mut asset_props = vec![
+                (
+                    Edn::kw("logseq.property.asset/type"),
+                    Edn::str(att.ext.clone()),
+                ),
+                (
+                    Edn::kw("logseq.property.asset/checksum"),
+                    Edn::Str(checksum),
+                ),
+                (
+                    Edn::kw("logseq.property.asset/size"),
+                    Edn::Int(data.len() as i64),
+                ),
+            ];
+            if let Some(width) = asset.width {
+                asset_props.push((
+                    Edn::kw("logseq.property.asset/resize-metadata"),
+                    Edn::Map(vec![(Edn::kw("width"), Edn::Int(width))]),
+                ));
+            }
             asset_blocks.push(Edn::Map(vec![
                 (Edn::kw("block/title"), Edn::str(att.stem.clone())),
                 (Edn::kw("block/uuid"), Edn::Uuid(asset.uuid)),
@@ -1065,28 +1294,34 @@ impl<'a> Converter<'a> {
                     Edn::kw("build/tags"),
                     Edn::Vector(vec![Edn::kw("logseq.class/Asset")]),
                 ),
-                (
-                    Edn::kw("build/properties"),
-                    Edn::Map(vec![
-                        (
-                            Edn::kw("logseq.property.asset/type"),
-                            Edn::str(att.ext.clone()),
-                        ),
-                        (
-                            Edn::kw("logseq.property.asset/checksum"),
-                            Edn::Str(checksum),
-                        ),
-                        (
-                            Edn::kw("logseq.property.asset/size"),
-                            Edn::Int(data.len() as i64),
-                        ),
-                    ]),
-                ),
+                (Edn::kw("build/properties"), Edn::Map(asset_props)),
             ]));
             asset_files.push(AssetFile {
                 source: att.abs_path.clone(),
                 file_name: format!("{}.{}", asset.uuid, att.ext),
             });
+        }
+        if !favorites.is_empty() {
+            // Like the Asset page, matched by title to Logseq's own page.
+            let blocks = favorites
+                .into_iter()
+                .map(|e| {
+                    Edn::Map(vec![
+                        (Edn::kw("block/title"), Edn::str("")),
+                        (Edn::kw("block/link"), Edn::uuid_ref(entities[e].uuid)),
+                    ])
+                })
+                .collect();
+            pages.push(Edn::Map(vec![
+                (
+                    Edn::kw("page"),
+                    Edn::Map(vec![(
+                        Edn::kw("block/title"),
+                        Edn::str(FAVORITES_PAGE_TITLE),
+                    )]),
+                ),
+                (Edn::kw("blocks"), Edn::Vector(blocks)),
+            ]));
         }
         if !asset_blocks.is_empty() {
             // The page is matched by title to Logseq's existing Asset class page.
@@ -1144,6 +1379,32 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Entities of the notes bookmarked in Obsidian, in bookmark order.
+    /// Headings and blocks are bookmarked as their note, since Logseq's
+    /// favorites are pages.
+    fn favorites(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for bookmark in &self.vault.bookmarks {
+            match bookmark {
+                Bookmark::File { path } => match self.vault.resolve(path, None) {
+                    Some(Target::Note(n)) => {
+                        let e = self.note_entity[n];
+                        if !out.contains(&e) {
+                            out.push(e);
+                        }
+                    }
+                    _ => self
+                        .warnings
+                        .push(format!("bookmark {path:?} skipped, no such note")),
+                },
+                Bookmark::Other { kind, title } => self.warnings.push(format!(
+                    "{kind} bookmark {title:?} skipped, Logseq favorites are pages"
+                )),
+            }
+        }
+        out
+    }
+
     fn entity_times(&self, ent: &Entity) -> (Option<i64>, Option<i64>) {
         let notes = ent.notes.iter().map(|&n| &self.vault.notes[n]);
         let created = notes.clone().map(|n| n.created_ms).min();
@@ -1156,6 +1417,194 @@ impl<'a> Converter<'a> {
 // Helpers
 // -------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------
+// Footnotes
+// -------------------------------------------------------------------------
+
+/// Logseq resolves footnotes within a block, while Obsidian collects the
+/// definitions at the end of the note. Each referenced definition is moved
+/// into the blocks that reference it, and inline footnotes (`^[text]`) are
+/// numbered like Obsidian renders them.
+fn attach_footnotes(blocks: &mut Vec<MdBlock>) {
+    let mut labels = Vec::new();
+    walk_texts(blocks, &mut |text| labels.extend(footnote_refs(text)));
+    let mut next = labels
+        .iter()
+        .filter_map(|l| l.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut defs: HashMap<String, String> = HashMap::new();
+    walk_texts_mut(blocks, &mut |text| {
+        if text.contains("^[") {
+            *text = number_inline_footnotes(text, &mut next, &mut defs);
+        }
+    });
+    collect_footnote_defs(blocks, &mut defs);
+    if defs.is_empty() {
+        return;
+    }
+    let mut referenced = BTreeSet::new();
+    walk_texts(blocks, &mut |text| {
+        if footnote_def_label(text).is_none() {
+            referenced.extend(footnote_refs(text));
+        }
+    });
+    remove_footnote_defs(blocks, &referenced);
+    walk_texts_mut(blocks, &mut |text| {
+        let mut appended = BTreeSet::new();
+        for label in footnote_refs(text) {
+            if let Some(def) = defs.get(&label)
+                && appended.insert(label)
+            {
+                text.push_str("\n\n");
+                text.push_str(def);
+            }
+        }
+    });
+}
+
+fn has_inline_text(block: &MdBlock) -> bool {
+    !matches!(block.kind, BlockKind::Code { .. } | BlockKind::Math)
+}
+
+fn walk_texts(blocks: &[MdBlock], f: &mut impl FnMut(&str)) {
+    for b in blocks {
+        if has_inline_text(b) {
+            f(&b.text);
+        }
+        walk_texts(&b.children, f);
+    }
+}
+
+fn walk_texts_mut(blocks: &mut [MdBlock], f: &mut impl FnMut(&mut String)) {
+    for b in blocks {
+        if has_inline_text(b) {
+            f(&mut b.text);
+        }
+        walk_texts_mut(&mut b.children, f);
+    }
+}
+
+/// Label of a footnote definition block (`[^label]: text`).
+fn footnote_def_label(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("[^")?;
+    let end = rest.find("]:")?;
+    let label = &rest[..end];
+    (!label.is_empty() && !label.contains(char::is_whitespace)).then_some(label)
+}
+
+fn collect_footnote_defs(blocks: &[MdBlock], defs: &mut HashMap<String, String>) {
+    for b in blocks {
+        if b.kind == BlockKind::Text
+            && b.task.is_none()
+            && b.children.is_empty()
+            && let Some(label) = footnote_def_label(&b.text)
+        {
+            defs.entry(label.to_string())
+                .or_insert_with(|| b.text.clone());
+        }
+        collect_footnote_defs(&b.children, defs);
+    }
+}
+
+fn remove_footnote_defs(blocks: &mut Vec<MdBlock>, referenced: &BTreeSet<String>) {
+    blocks.retain(|b| {
+        !(b.kind == BlockKind::Text
+            && b.task.is_none()
+            && b.children.is_empty()
+            && footnote_def_label(&b.text).is_some_and(|l| referenced.contains(l)))
+    });
+    for b in blocks {
+        remove_footnote_defs(&mut b.children, referenced);
+    }
+}
+
+/// Labels of footnote references (`[^label]`) outside code spans.
+fn footnote_refs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if rest.starts_with('`') {
+            i += code_span_len(rest);
+        } else if let Some(after) = rest.strip_prefix("[^")
+            && let Some(end) = after.find(']')
+            && end > 0
+            && !after[..end].contains(char::is_whitespace)
+            && !after[end + 1..].starts_with(':')
+        {
+            out.push(after[..end].to_string());
+            i += 2 + end + 1;
+        } else {
+            i += rest.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
+/// Replaces inline footnotes `^[text]` with numbered references and records
+/// their definitions.
+fn number_inline_footnotes(
+    text: &str,
+    next: &mut u32,
+    defs: &mut HashMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if rest.starts_with('`') {
+            let len = code_span_len(rest);
+            out.push_str(&rest[..len]);
+            i += len;
+            continue;
+        }
+        if rest.starts_with("^[") {
+            let mut depth = 0;
+            let close = rest[1..].char_indices().find_map(|(j, c)| {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            });
+            if let Some(end) = close {
+                let label = next.to_string();
+                *next += 1;
+                defs.insert(label.clone(), format!("[^{label}]: {}", &rest[2..end]));
+                out.push_str(&format!("[^{label}]"));
+                i += end + 1;
+                continue;
+            }
+        }
+        let c = rest.chars().next().expect("non-empty");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+fn observe_task_dates(blocks: &[MdBlock], builder: &mut SchemaBuilder) {
+    for block in blocks {
+        if block.task.is_some() {
+            let meta = extract_task_meta(&block.text);
+            for (i, (_, prop)) in TASK_DATE_PROPS.iter().enumerate() {
+                if meta.other_dates[i].is_some() {
+                    builder.observe_type(prop, PropType::DateTime);
+                }
+            }
+        }
+        observe_task_dates(&block.children, builder);
+    }
+}
+
 /// Logseq's deterministic journal page UUID: `00000001-YYYY-MMDD-0000-000000000000`.
 pub fn journal_uuid(date: NaiveDate) -> Uuid {
     let s = format!(
@@ -1165,6 +1614,33 @@ pub fn journal_uuid(date: NaiveDate) -> Uuid {
         date.day()
     );
     Uuid::parse_str(&s).expect("valid journal uuid")
+}
+
+/// Rewrites Obsidian template variables to Logseq's: `{{date}}` and
+/// `{{date:FORMAT}}` become today's journal page, `{{time}}` the current time
+/// and `{{title}}` the page the template is inserted into.
+fn template_variables(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            rest = &rest[start..];
+            break;
+        };
+        let inner = &after[..end];
+        let name = inner.split(':').next().unwrap_or("").trim().to_lowercase();
+        match name.as_str() {
+            "date" => out.push_str("<% today %>"),
+            "time" => out.push_str("<% time %>"),
+            "title" => out.push_str("<% current page %>"),
+            _ => out.push_str(&rest[start..start + 2 + end + 2]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Splits `target#sub|label` (also accepting `\|` used inside tables).
@@ -1197,6 +1673,13 @@ fn normalize_heading(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Width of an embed size like `300` or `300x200`.
+fn embed_width(size: &str) -> Option<i64> {
+    let size = size.trim();
+    let width = size.split_once('x').map_or(size, |(w, _)| w);
+    width.parse().ok().filter(|&w| w > 0)
 }
 
 fn escape_label(label: &str) -> String {
@@ -1268,8 +1751,7 @@ fn task_status(c: char) -> &'static str {
     }
 }
 
-fn local_midnight_ms(date: NaiveDate) -> i64 {
-    let dt = date.and_hms_opt(0, 0, 0).expect("midnight exists");
+fn local_ms(dt: NaiveDateTime) -> i64 {
     Local
         .from_local_datetime(&dt)
         .earliest()
@@ -1277,10 +1759,14 @@ fn local_midnight_ms(date: NaiveDate) -> i64 {
         .unwrap_or_else(|| dt.and_utc().timestamp_millis())
 }
 
+fn local_midnight_ms(date: NaiveDate) -> i64 {
+    local_ms(date.and_hms_opt(0, 0, 0).expect("midnight exists"))
+}
+
 /// Maps an Obsidian callout type to a Logseq admonition and, for types
 /// without a direct equivalent, a title that keeps the original meaning.
-fn callout_admonition(kind: &str) -> (&'static str, Option<&'static str>) {
-    match kind {
+fn callout_admonition(kind: &str) -> (&'static str, Option<String>) {
+    let (admonition, title) = match kind {
         "note" => ("NOTE", None),
         "tip" => ("TIP", None),
         "hint" => ("TIP", Some("Hint")),
@@ -1297,25 +1783,73 @@ fn callout_admonition(kind: &str) -> (&'static str, Option<&'static str>) {
         "todo" => ("NOTE", Some("Todo")),
         "question" | "help" | "faq" => ("NOTE", Some("Question")),
         "example" => ("NOTE", Some("Example")),
-        _ => ("NOTE", None),
+        // Obsidian titles custom callouts with their type.
+        _ => return ("NOTE", Some(capitalize(kind))),
+    };
+    (admonition, title.map(str::to_string))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
+/// Tasks plugin dates without a Logseq built-in property, stored in user
+/// properties with these titles.
+const TASK_DATE_PROPS: [(&str, &str); 3] = [
+    ("🛫", "Start date"),
+    ("✅", "Done date"),
+    ("❌", "Cancelled date"),
+];
+
+/// Tasks plugin signifiers; a recurrence rule runs until the next one.
+const TASK_SIGNIFIERS: [&str; 15] = [
+    "📅", "⏳", "🛫", "✅", "➕", "❌", "🔁", "🔺", "⏫", "🔼", "🔽", "⏬", "🆔", "⛔", "🏁",
+];
+
+#[derive(Debug, PartialEq)]
+struct Recurrence {
+    frequency: i64,
+    unit: &'static str,
+    when_done: bool,
+}
+
+#[derive(Debug, Default)]
 struct TaskMeta {
     text: String,
     priority: Option<&'static str>,
     deadline: Option<NaiveDate>,
     scheduled: Option<NaiveDate>,
+    created: Option<NaiveDate>,
+    /// Values for [`TASK_DATE_PROPS`], by index.
+    other_dates: [Option<NaiveDate>; 3],
+    recurrence: Option<Recurrence>,
 }
 
 /// Extracts Obsidian Tasks plugin metadata (`📅 2024-01-01`, `⏫`, ...).
 fn extract_task_meta(text: &str) -> TaskMeta {
     let mut meta = TaskMeta {
         text: text.to_string(),
-        priority: None,
-        deadline: None,
-        scheduled: None,
+        ..Default::default()
     };
+    // Recurrences need a date to repeat from; otherwise the rule stays text.
+    if (text.contains("📅") || text.contains("⏳"))
+        && let Some(pos) = meta.text.find("🔁")
+    {
+        let after = &meta.text[pos + "🔁".len()..];
+        let end = TASK_SIGNIFIERS
+            .iter()
+            .filter_map(|s| after.find(s))
+            .min()
+            .unwrap_or(after.len());
+        if let Some(r) = parse_recurrence(&after[..end]) {
+            meta.recurrence = Some(r);
+            meta.text = format!("{}{}", &meta.text[..pos], &after[end..]);
+        }
+    }
     for (emoji, prio) in [
         ("🔺", "logseq.property/priority.urgent"),
         ("⏫", "logseq.property/priority.high"),
@@ -1328,22 +1862,54 @@ fn extract_task_meta(text: &str) -> TaskMeta {
             meta.text = meta.text.replace(emoji, "");
         }
     }
-    for (emoji, is_deadline) in [("📅", true), ("⏳", false)] {
-        if let Some(pos) = meta.text.find(emoji) {
-            let after = meta.text[pos + emoji.len()..].trim_start();
-            if let Some(date) = after.get(..10).and_then(properties::parse_iso_date) {
-                let consumed = meta.text.len() - after.len() + 10;
-                meta.text = format!("{}{}", &meta.text[..pos], &meta.text[consumed..]);
-                if is_deadline {
-                    meta.deadline = Some(date);
-                } else {
-                    meta.scheduled = Some(date);
-                }
-            }
-        }
-    }
+    let mut take_date = |emoji: &str| -> Option<NaiveDate> {
+        let pos = meta.text.find(emoji)?;
+        let after = meta.text[pos + emoji.len()..].trim_start();
+        let date = after.get(..10).and_then(properties::parse_iso_date)?;
+        let consumed = meta.text.len() - after.len() + 10;
+        meta.text = format!("{}{}", &meta.text[..pos], &meta.text[consumed..]);
+        Some(date)
+    };
+    let deadline = take_date("📅");
+    let scheduled = take_date("⏳");
+    let created = take_date("➕");
+    let other_dates = TASK_DATE_PROPS.map(|(emoji, _)| take_date(emoji));
+    meta.deadline = deadline;
+    meta.scheduled = scheduled;
+    meta.created = created;
+    meta.other_dates = other_dates;
     meta.text = meta.text.split_whitespace().collect::<Vec<_>>().join(" ");
     meta
+}
+
+/// Parses simple Tasks plugin rules: `every day`, `every 2 weeks`,
+/// `every month when done`. Rules naming weekdays or dates have no Logseq
+/// equivalent and return `None`.
+fn parse_recurrence(rule: &str) -> Option<Recurrence> {
+    let rule = rule.trim().to_lowercase();
+    let rule = rule.strip_prefix("every ")?;
+    let (rule, when_done) = match rule.strip_suffix(" when done") {
+        Some(r) => (r.trim(), true),
+        None => (rule.trim(), false),
+    };
+    let words: Vec<&str> = rule.split_whitespace().collect();
+    let (frequency, unit) = match words.as_slice() {
+        [unit] => (1, *unit),
+        [n, unit] => (n.parse().ok().filter(|&n: &i64| n > 0)?, *unit),
+        _ => return None,
+    };
+    let unit = match unit.trim_end_matches('s') {
+        "day" => "logseq.property.repeat/recur-unit.day",
+        "week" => "logseq.property.repeat/recur-unit.week",
+        "month" => "logseq.property.repeat/recur-unit.month",
+        "year" => "logseq.property.repeat/recur-unit.year",
+        _ => return None,
+    };
+    Some(Recurrence {
+        frequency,
+        unit,
+        when_done,
+    })
 }
 
 struct MdLink {
@@ -1433,6 +1999,33 @@ mod tests {
     }
 
     #[test]
+    fn footnotes_join_their_references() {
+        let mut blocks = parse_note(
+            "Text[^1] and `[^x]` and inline^[a [[link]]].\n\nOther[^n2]\n\n[^1]: First.\n\n[^n2]: Second.\n\n[^unused]: Kept.\n",
+            ParseOptions::default(),
+        )
+        .blocks;
+        attach_footnotes(&mut blocks);
+        let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Text[^1] and `[^x]` and inline[^2].\n\n[^1]: First.\n\n[^2]: a [[link]]",
+                "Other[^n2]\n\n[^n2]: Second.",
+                "[^unused]: Kept.",
+            ]
+        );
+    }
+
+    #[test]
+    fn template_vars() {
+        assert_eq!(
+            template_variables("# {{title}}\n{{date:YYYY-MM-DD}} {{ time }} {{other}} {{"),
+            "# <% current page %>\n<% today %> <% time %> {{other}} {{"
+        );
+    }
+
+    #[test]
     fn wikilink_parts() {
         assert_eq!(
             split_wikilink("Note#Head|Label"),
@@ -1466,6 +2059,31 @@ mod tests {
         assert_eq!(m.priority, Some("logseq.property/priority.high"));
         assert_eq!(m.deadline, NaiveDate::from_ymd_opt(2024, 2, 1));
         assert_eq!(m.scheduled, NaiveDate::from_ymd_opt(2024, 1, 30));
+
+        let m = extract_task_meta(
+            "Water plants 🔁 every 2 weeks when done ➕ 2024-01-01 🛫 2024-01-02 📅 2024-01-05 ✅ 2024-01-04",
+        );
+        assert_eq!(m.text, "Water plants");
+        assert_eq!(
+            m.recurrence,
+            Some(Recurrence {
+                frequency: 2,
+                unit: "logseq.property.repeat/recur-unit.week",
+                when_done: true
+            })
+        );
+        assert_eq!(m.created, NaiveDate::from_ymd_opt(2024, 1, 1));
+        assert_eq!(m.other_dates[0], NaiveDate::from_ymd_opt(2024, 1, 2));
+        assert_eq!(m.other_dates[1], NaiveDate::from_ymd_opt(2024, 1, 4));
+
+        // Without a date, or with a rule Logseq can't express, it stays text.
+        let m = extract_task_meta("Stretch 🔁 every day");
+        assert_eq!(m.text, "Stretch 🔁 every day");
+        assert_eq!(m.recurrence, None);
+        let m = extract_task_meta("Gym 🔁 every week on Monday 📅 2024-01-01");
+        assert_eq!(m.text, "Gym 🔁 every week on Monday");
+        assert_eq!(m.recurrence, None);
+        assert_eq!(parse_recurrence(" every month").unwrap().frequency, 1);
     }
 
     #[test]

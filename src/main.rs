@@ -312,6 +312,9 @@ fn report(args: &Args, conversion: &Conversion) {
             s.placeholder_pages, s.alias_pages
         );
     }
+    if s.templates + s.favorites > 0 {
+        eprintln!("  {} templates and {} favorites", s.templates, s.favorites);
+    }
     if s.unreferenced_attachments > 0 {
         eprintln!(
             "  {} attachments are not linked from any note and were skipped",

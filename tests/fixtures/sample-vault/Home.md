@@ -7,6 +7,7 @@ done: true
 website: https://obsidian.md
 related: ["[[Project Alpha]]", "[[Missing Note]]"]
 due: 2024-03-01
+meeting: 2024-03-01T14:30
 cssclasses: [wide]
 ---
 # Welcome
@@ -23,6 +24,8 @@ Issue #42 is not a tag. %%hidden comment%%
 	- [x] Finished task
 	- [/] In progress
 	- [-] Cancelled
+	- [ ] Water plants 🔁 every 2 weeks when done ➕ 2024-01-01 🛫 2024-01-02 📅 2024-01-05
+	- [x] Filed taxes ✅ 2024-01-04
 1. First
 2. Second
 
@@ -44,6 +47,9 @@ Remote image ![logo](https://example.com/logo.png) stays.
 > [!info]- Folded info
 > Body text
 
+> [!recipe]
+> Custom callout body
+
 > A plain quote
 > spanning lines
 
@@ -64,3 +70,7 @@ $$
 
 ---
 Last line ^home-end
+
+Claim with a source[^1] and an aside^[Inline footnote text].
+
+[^1]: The cited source.

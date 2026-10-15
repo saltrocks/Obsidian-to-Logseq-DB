@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use yaml_serde::Value;
 
 /// Frontmatter keys with Obsidian-specific meaning (compared lowercase).
@@ -17,6 +17,7 @@ pub enum PropType {
     Checkbox,
     Url,
     Date,
+    DateTime,
     Node,
 }
 
@@ -28,6 +29,7 @@ impl PropType {
             PropType::Checkbox => "checkbox",
             PropType::Url => "url",
             PropType::Date => "date",
+            PropType::DateTime => "datetime",
             PropType::Node => "node",
         }
     }
@@ -60,6 +62,8 @@ fn classify_str(s: &str) -> Option<PropType> {
         Some(PropType::Node)
     } else if is_url(s) {
         Some(PropType::Url)
+    } else if parse_iso_datetime(s).is_some() {
+        Some(PropType::DateTime)
     } else if parse_iso_date(s).is_some() {
         Some(PropType::Date)
     } else {
@@ -95,6 +99,21 @@ pub fn parse_iso_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }
 
+/// Parses `YYYY-MM-DDTHH:MM[:SS]` (also with a space instead of `T`), the
+/// format of Obsidian's "Date & time" properties. Plain dates return `None`.
+pub fn parse_iso_datetime(s: &str) -> Option<NaiveDateTime> {
+    let s = s.trim();
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+    ]
+    .iter()
+    .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
+}
+
 /// Accumulates every value seen for each frontmatter key across the vault and
 /// infers one schema per key.
 #[derive(Debug, Default)]
@@ -111,15 +130,24 @@ struct KeyStats {
 }
 
 impl SchemaBuilder {
-    pub fn observe(&mut self, key: &str, value: &Value) {
+    fn stats(&mut self, key: &str) -> &mut KeyStats {
         let lower = key.to_lowercase();
-        let stats = self.keys.entry(lower.clone()).or_insert_with(|| {
-            self.order.push(lower.clone());
+        self.keys.entry(lower.clone()).or_insert_with(|| {
+            self.order.push(lower);
             KeyStats {
                 title: key.to_string(),
                 ..Default::default()
             }
-        });
+        })
+    }
+
+    /// Records a single value of a known type, e.g. a Tasks plugin date.
+    pub fn observe_type(&mut self, key: &str, ptype: PropType) {
+        self.stats(key).types.insert(ptype);
+    }
+
+    pub fn observe(&mut self, key: &str, value: &Value) {
+        let stats = self.stats(key);
         match value {
             Value::Sequence(items) => {
                 stats.many = true;
@@ -150,13 +178,17 @@ impl SchemaBuilder {
         let mut out = HashMap::new();
         for key in self.order {
             let stats = &self.keys[&key];
+            let date_types = BTreeSet::from([PropType::Date, PropType::DateTime]);
             let ptype = match stats.types.len() {
                 0 => PropType::Default,
                 1 => *stats.types.iter().next().unwrap(),
+                // Dates mixed with date-times keep the times.
+                _ if stats.types == date_types => PropType::DateTime,
                 _ => PropType::Default,
             };
-            // Checkboxes can't hold several values.
-            let ptype = if ptype == PropType::Checkbox && stats.many {
+            // Checkboxes and date-times can't hold several values.
+            let single_only = matches!(ptype, PropType::Checkbox | PropType::DateTime);
+            let ptype = if single_only && stats.many {
                 PropType::Default
             } else {
                 ptype
@@ -282,6 +314,10 @@ mod tests {
         b.observe("rating", &yaml("4.5"));
         b.observe("done", &yaml("true"));
         b.observe("due", &yaml("2024-01-02"));
+        b.observe("meeting", &yaml("2024-01-02T14:30"));
+        b.observe("mixed-dates", &yaml("2024-01-02"));
+        b.observe("mixed-dates", &yaml("2024-01-03T09:00"));
+        b.observe("times", &yaml("[2024-01-02T14:30]"));
         b.observe("site", &yaml("https://example.com"));
         b.observe("related", &yaml("[\"[[A]]\", \"[[B]]\"]"));
         b.observe("mixed", &yaml("1"));
@@ -292,6 +328,9 @@ mod tests {
         assert_eq!(s["rating"].ident, "user.property/rating");
         assert_eq!(s["done"].ptype, PropType::Checkbox);
         assert_eq!(s["due"].ptype, PropType::Date);
+        assert_eq!(s["meeting"].ptype, PropType::DateTime);
+        assert_eq!(s["mixed-dates"].ptype, PropType::DateTime);
+        assert_eq!(s["times"].ptype, PropType::Default);
         assert_eq!(s["site"].ptype, PropType::Url);
         assert_eq!(s["related"].ptype, PropType::Node);
         assert!(s["related"].many);
