@@ -48,7 +48,7 @@ struct Args {
     #[arg(long)]
     daily_format: Option<String>,
 
-    /// Daily notes folder, used when the format contains `/`
+    /// Daily notes folder; only notes in it become journal pages
     #[arg(long)]
     daily_folder: Option<String>,
 

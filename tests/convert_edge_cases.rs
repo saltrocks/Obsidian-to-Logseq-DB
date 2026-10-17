@@ -67,3 +67,17 @@ fn duplicate_frontmatter_keys_keep_the_rest() {
         conv.warnings
     );
 }
+
+#[test]
+fn dated_note_outside_daily_folder_stays_a_page() {
+    let (conv, edn) = convert_vault(&[
+        (
+            ".obsidian/daily-notes.json",
+            r#"{"folder":"Daily/","format":"YYYY-MM-DD"}"#,
+        ),
+        ("Daily/2024-01-05.md", "daily"),
+        ("Meetings/2024-01-05.md", "meeting"),
+    ]);
+    assert_eq!(conv.stats.journals, 1);
+    assert!(edn.contains(":block/title \"2024-01-05\""), "{edn}");
+}

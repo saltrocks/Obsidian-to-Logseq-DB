@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use walkdir::WalkDir;
 
@@ -64,6 +64,8 @@ pub struct Vault {
     /// Folder of the core Templates plugin (`.obsidian/templates.json`).
     pub templates_folder: Option<String>,
     pub bookmarks: Vec<Bookmark>,
+    /// Entries that could not be read and were skipped.
+    pub warnings: Vec<String>,
     notes_by_stem: HashMap<String, Vec<usize>>,
     notes_by_path: HashMap<String, usize>,
     atts_by_name: HashMap<String, Vec<usize>>,
@@ -77,13 +79,16 @@ impl Vault {
         let root = root
             .canonicalize()
             .with_context(|| format!("cannot open vault {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("vault {} is not a folder", root.display());
+        }
         let mut vault = Vault {
             root: root.clone(),
             ..Default::default()
         };
         let exclude: Vec<String> = exclude
             .iter()
-            .map(|e| e.trim_matches('/').to_lowercase())
+            .map(|e| normalize_folder(e).to_lowercase())
             .collect();
         let walker = WalkDir::new(&root)
             .follow_links(true)
@@ -91,7 +96,17 @@ impl Vault {
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
         for entry in walker {
-            let entry = entry?;
+            // Dangling symlinks, loops and unreadable folders are common in
+            // synced vaults; skip them instead of failing the conversion.
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    vault
+                        .warnings
+                        .push(format!("skipped unreadable entry: {e}"));
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -208,9 +223,8 @@ impl Vault {
         let folder = folder_override
             .map(str::to_string)
             .or_else(|| config["folder"].as_str().map(str::to_string))
-            .unwrap_or_default()
-            .trim_matches('/')
-            .to_string();
+            .map(|f| normalize_folder(&f))
+            .unwrap_or_default();
         let format = DateFormat::parse(&format)?;
         self.daily = Some(DailyConfig { format, folder });
         Ok(())
@@ -220,12 +234,17 @@ impl Vault {
     pub fn note_journal_date(&self, note: &Note) -> Option<NaiveDate> {
         let daily = self.daily.as_ref()?;
         let path = strip_md(&note.rel_path);
+        // Like Obsidian, only notes in the daily notes folder are daily notes.
+        let rel = if daily.folder.is_empty() {
+            path
+        } else {
+            let prefix = path.get(..daily.folder.len() + 1)?;
+            if !prefix.eq_ignore_ascii_case(&format!("{}/", daily.folder)) {
+                return None;
+            }
+            &path[prefix.len()..]
+        };
         if daily.format.contains_path_separator() {
-            let rel = if daily.folder.is_empty() {
-                path
-            } else {
-                path.strip_prefix(&format!("{}/", daily.folder))?
-            };
             daily.format.parse_date(rel)
         } else {
             daily.format.parse_date(&note.stem)
@@ -389,9 +408,27 @@ pub fn split_ext(file_name: &str) -> (&str, &str) {
 }
 
 fn strip_md(path: &str) -> &str {
-    path.strip_suffix(".md")
-        .or_else(|| path.strip_suffix(".MD"))
-        .unwrap_or(path)
+    path.len()
+        .checked_sub(3)
+        .filter(|&i| {
+            path.get(i..)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(".md"))
+        })
+        .map_or(path, |i| &path[..i])
+}
+
+/// Normalizes a vault-relative folder given by the user or the Obsidian
+/// config: `./Daily/` and `Daily` name the same folder.
+fn normalize_folder(folder: &str) -> String {
+    let mut f = folder.trim().trim_matches('/');
+    while let Some(rest) = f.strip_prefix("./") {
+        f = rest.trim_start_matches('/');
+    }
+    if f == "." {
+        String::new()
+    } else {
+        f.to_string()
+    }
 }
 
 fn strip_md_ci(lower: &str) -> &str {
@@ -481,5 +518,53 @@ mod tests {
             NaiveDate::from_ymd_opt(2024, 1, 5)
         );
         assert_eq!(v.note_journal_date(&v.notes[1]), None);
+    }
+
+    #[test]
+    fn daily_notes_only_in_daily_folder() {
+        let (_d, mut v) = vault_with(&["Daily/2024-01-05.md", "Meetings/2024-01-05.md"]);
+        v.load_daily_config(None, Some("./daily/")).unwrap();
+        assert_eq!(v.notes[0].rel_path, "Daily/2024-01-05.md");
+        assert_eq!(
+            v.note_journal_date(&v.notes[0]),
+            NaiveDate::from_ymd_opt(2024, 1, 5)
+        );
+        assert_eq!(v.note_journal_date(&v.notes[1]), None);
+    }
+
+    #[test]
+    fn exclude_accepts_dot_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        fs::write(dir.path().join("Archive/Old.md"), "x").unwrap();
+        fs::write(dir.path().join("Keep.md"), "x").unwrap();
+        let v = Vault::scan(dir.path(), &["./Archive/".to_string()]).unwrap();
+        assert_eq!(v.notes.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_skipped() {
+        let (d, _) = vault_with(&["Note.md"]);
+        std::os::unix::fs::symlink("/nonexistent", d.path().join("broken.png")).unwrap();
+        let v = Vault::scan(d.path(), &[]).unwrap();
+        assert_eq!(v.notes.len(), 1);
+        assert_eq!(v.warnings.len(), 1);
+    }
+
+    #[test]
+    fn mixed_case_extension_resolves_by_path() {
+        let (_d, v) = vault_with(&["F/Note.Md", "G/Note.md"]);
+        assert_eq!(note_path(&v, v.resolve("F/Note", None)), Some("F/Note.Md"));
+        assert_eq!(
+            note_path(&v, v.resolve("F/Note.Md", None)),
+            Some("F/Note.Md")
+        );
+    }
+
+    #[test]
+    fn file_is_not_a_vault() {
+        let (d, _) = vault_with(&["Note.md"]);
+        assert!(Vault::scan(&d.path().join("Note.md"), &[]).is_err());
     }
 }

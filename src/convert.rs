@@ -145,7 +145,7 @@ pub fn convert(vault: &Vault, opts: &ConvertOptions) -> Result<Conversion> {
         class_idents: BTreeSet::new(),
         schemas: HashMap::new(),
         used_props: BTreeSet::new(),
-        warnings: Vec::new(),
+        warnings: vault.warnings.clone(),
         block_count: 0,
         template_count: 0,
     };
