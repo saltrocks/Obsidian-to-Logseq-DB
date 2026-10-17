@@ -272,8 +272,10 @@ impl<'a> Parser<'a> {
             self.parse_fence(Some(owner_node), indent, c, n, info);
             return true;
         }
-        if content_rest.starts_with("$$") {
-            self.parse_math(Some(owner_node));
+        if content_rest.starts_with("$$")
+            && let Some(end) = self.math_end()
+        {
+            self.parse_math(Some(owner_node), end);
             return true;
         }
         if content_rest.starts_with('>') {
@@ -309,9 +311,11 @@ impl<'a> Parser<'a> {
             self.parse_fence(self.heading_container(), indent, c, n, info);
             return;
         }
-        if rest.starts_with("$$") {
+        if rest.starts_with("$$")
+            && let Some(end) = self.math_end()
+        {
             self.list.clear();
-            self.parse_math(self.heading_container());
+            self.parse_math(self.heading_container(), end);
             return;
         }
         if indent < 4
@@ -431,33 +435,49 @@ impl<'a> Parser<'a> {
         self.open_text = None;
     }
 
-    fn parse_math(&mut self, parent: Option<usize>) {
-        let first = self.lines[self.pos].trim();
-        self.pos += 1;
-        let after = &first[2..];
+    /// Line index of the `$$` closing the math block opened on the current
+    /// line. `None` when the block never closes or a one-line `$$…$$` has
+    /// text after it; Obsidian keeps both as text.
+    fn math_end(&self) -> Option<usize> {
+        let after = &self.lines[self.pos].trim()[2..];
         if let Some(end) = after.find("$$") {
-            let block = MdBlock::new(BlockKind::Math, after[..end].trim().to_string());
+            return after[end + 2..].trim().is_empty().then_some(self.pos);
+        }
+        (self.pos + 1..self.lines.len()).find(|&i| self.lines[i].contains("$$"))
+    }
+
+    /// Parses the math block from the current line to line `end`, as found
+    /// by `math_end`. Text after the closing `$$` becomes a text block.
+    fn parse_math(&mut self, parent: Option<usize>, end: usize) {
+        let after = &self.lines[self.pos].trim()[2..];
+        if end == self.pos {
+            let close = after.find("$$").expect("math_end found the closing $$");
+            let block = MdBlock::new(BlockKind::Math, after[..close].trim().to_string());
             self.add(parent, block);
             self.open_text = None;
+            self.pos += 1;
             return;
         }
         let mut content = Vec::new();
         if !after.trim().is_empty() {
             content.push(after.trim().to_string());
         }
-        while self.pos < self.lines.len() {
-            let line = self.lines[self.pos].trim();
-            self.pos += 1;
-            if let Some(stripped) = line.strip_suffix("$$") {
-                if !stripped.trim().is_empty() {
-                    content.push(stripped.trim().to_string());
-                }
-                break;
-            }
-            content.push(line.to_string());
+        for line in &self.lines[self.pos + 1..end] {
+            content.push(line.trim().to_string());
         }
+        let last = self.lines[end].trim();
+        let close = last.find("$$").expect("math_end found the closing $$");
+        if !last[..close].trim().is_empty() {
+            content.push(last[..close].trim().to_string());
+        }
+        let trailing = last[close + 2..].trim();
+        self.pos = end + 1;
         self.add(parent, MdBlock::new(BlockKind::Math, content.join("\n")));
         self.open_text = None;
+        if !trailing.is_empty() {
+            let id = self.add(parent, MdBlock::new(BlockKind::Text, trailing.to_string()));
+            self.open_text = Some(id);
+        }
     }
 
     /// Collects consecutive `>` lines. `list_indent` is set when the quote is
@@ -841,6 +861,22 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Math);
         assert_eq!(blocks[0].text, "a^2");
         assert_eq!(blocks[1].text, "b");
+    }
+
+    #[test]
+    fn math_blocks_end_at_any_closing_dollars() {
+        let blocks = parse("$$\na\n$$ where a is x\n\n# H\n");
+        assert_eq!(titles(&blocks), vec!["a", "where a is x", "H"]);
+        assert_eq!(blocks[0].kind, BlockKind::Math);
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+    }
+
+    #[test]
+    fn unclosed_or_inline_math_stays_text() {
+        let blocks = parse("$$x$$ is inline\n\n$$ 5\n\n# Heading\n- item");
+        assert_eq!(titles(&blocks), vec!["$$x$$ is inline", "$$ 5", "Heading"]);
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+        assert_eq!(titles(&blocks[2].children), vec!["item"]);
     }
 
     #[test]
