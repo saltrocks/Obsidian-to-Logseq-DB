@@ -3,12 +3,13 @@
 use std::collections::{BTreeSet, HashMap};
 
 use chrono::{NaiveDate, NaiveDateTime};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use yaml_serde::Value;
 
 /// Frontmatter keys with Obsidian-specific meaning (compared lowercase).
 pub const TAG_KEYS: &[&str] = &["tags", "tag"];
 pub const ALIAS_KEYS: &[&str] = &["aliases", "alias"];
-pub const DROPPED_KEYS: &[&str] = &["cssclasses", "cssclass", "position"];
+pub const DROPPED_KEYS: &[&str] = &["cssclasses", "cssclass"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropType {
@@ -276,6 +277,54 @@ pub fn alias_values(value: &Value) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Frontmatter entries and the keys that were repeated.
+pub type FrontmatterEntries = (Vec<(Value, Value)>, Vec<Value>);
+
+/// Top-level frontmatter entries in file order, or `None` for an empty
+/// document. A repeated key keeps its last value and is also returned in
+/// the list of duplicates; deserializing into a `Value` would reject the
+/// whole frontmatter instead.
+pub fn parse_frontmatter(yaml: &str) -> Result<Option<FrontmatterEntries>, yaml_serde::Error> {
+    struct Entries(Option<FrontmatterEntries>);
+
+    impl<'de> Deserialize<'de> for Entries {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(EntriesVisitor)
+        }
+    }
+
+    struct EntriesVisitor;
+
+    impl<'de> Visitor<'de> for EntriesVisitor {
+        type Value = Entries;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a mapping")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Entries, E> {
+            Ok(Entries(None))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Entries, A::Error> {
+            let mut entries: Vec<(Value, Value)> = Vec::new();
+            let mut duplicates = Vec::new();
+            while let Some((k, v)) = map.next_entry::<Value, Value>()? {
+                match entries.iter_mut().find(|(key, _)| *key == k) {
+                    Some(entry) => {
+                        entry.1 = v;
+                        duplicates.push(k);
+                    }
+                    None => entries.push((k, v)),
+                }
+            }
+            Ok(Entries(Some((entries, duplicates))))
+        }
+    }
+
+    yaml_serde::from_str::<Entries>(yaml).map(|e| e.0)
 }
 
 pub fn scalar_string(value: &Value) -> Option<String> {

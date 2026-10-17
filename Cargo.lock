@@ -426,6 +426,7 @@ dependencies = [
  "chrono",
  "clap",
  "percent-encoding",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

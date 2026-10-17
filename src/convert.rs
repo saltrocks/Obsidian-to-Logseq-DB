@@ -189,19 +189,22 @@ impl<'a> Converter<'a> {
                 .as_deref()
                 .filter(|y| !y.trim().is_empty())
             {
-                match yaml_serde::from_str::<Value>(yaml) {
-                    Ok(Value::Mapping(map)) => {
-                        for (k, v) in map {
+                match properties::parse_frontmatter(yaml) {
+                    Ok(Some((entries, duplicates))) => {
+                        for k in duplicates {
+                            self.warnings.push(format!(
+                                "{}: frontmatter key {:?} repeated, the last value is used",
+                                note.rel_path,
+                                properties::scalar_string(&k).unwrap_or_default()
+                            ));
+                        }
+                        for (k, v) in entries {
                             if let Some(key) = properties::scalar_string(&k) {
                                 frontmatter.push((key, v));
                             }
                         }
                     }
-                    Ok(Value::Null) => {}
-                    Ok(_) => self.warnings.push(format!(
-                        "{}: frontmatter is not a mapping, ignored",
-                        note.rel_path
-                    )),
+                    Ok(None) => {}
                     Err(e) => self.warnings.push(format!(
                         "{}: invalid frontmatter ignored ({e})",
                         note.rel_path
@@ -641,19 +644,26 @@ impl<'a> Converter<'a> {
                 (!text.trim().is_empty()).then_some(Edn::Str(text))
             }
             PropType::Number => match value {
-                Value::Number(n) => n
-                    .as_i64()
-                    .map(Edn::Int)
-                    .or_else(|| n.as_f64().map(Edn::Float)),
+                Value::Number(n) => n.as_i64().map(Edn::Int).or_else(|| {
+                    // Whole floats become ints so `1` and `1.0` dedupe;
+                    // NaN and infinities have no EDN form.
+                    let f = n.as_f64().filter(|f| f.is_finite())?;
+                    Some(if f.fract() == 0.0 && f.abs() < 9.0e15 {
+                        Edn::Int(f as i64)
+                    } else {
+                        Edn::Float(f)
+                    })
+                }),
                 _ => None,
             },
             PropType::Checkbox => match value {
                 Value::Bool(b) => Some(Edn::Bool(*b)),
                 _ => None,
             },
-            PropType::Url => {
-                properties::scalar_string(value).map(|s| Edn::Str(s.trim().to_string()))
-            }
+            PropType::Url => properties::scalar_string(value)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(Edn::Str),
             PropType::Date => {
                 let s = properties::scalar_string(value)?;
                 let date = properties::parse_iso_date(&s)?;
@@ -670,6 +680,9 @@ impl<'a> Converter<'a> {
             PropType::Node => {
                 let s = properties::scalar_string(value)?;
                 let inner = properties::single_wikilink(&s).unwrap_or(s.trim());
+                if inner.is_empty() {
+                    return None;
+                }
                 let (target, sub, _) = split_wikilink(inner);
                 let (uuid, _) = self.resolve_link(&target, sub.as_deref(), note, true)?;
                 Some(Edn::uuid_ref(uuid))
