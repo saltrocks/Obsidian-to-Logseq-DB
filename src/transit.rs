@@ -17,7 +17,7 @@ pub fn to_transit_json(value: &Edn) -> String {
 fn write(out: &mut String, value: &Edn) {
     match value {
         Edn::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Edn::Int(i) if i.abs() <= MAX_SAFE_INT => {
+        Edn::Int(i) if (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i) => {
             let _ = write!(out, "{i}");
         }
         Edn::Int(i) => write_json_str(out, &format!("~i{i}")),
@@ -72,6 +72,16 @@ fn write_json_str(out: &mut String, s: &str) {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn encodes_integer_boundaries_without_overflow() {
+        for value in [i64::MIN, -MAX_SAFE_INT - 1, MAX_SAFE_INT + 1, i64::MAX] {
+            assert_eq!(to_transit_json(&Edn::Int(value)), format!("\"~i{value}\""));
+        }
+        for value in [-MAX_SAFE_INT, 0, MAX_SAFE_INT] {
+            assert_eq!(to_transit_json(&Edn::Int(value)), value.to_string());
+        }
+    }
 
     #[test]
     fn encodes_values() {
