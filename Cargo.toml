@@ -18,3 +18,7 @@ yaml_serde = "0.10.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[[example]]
+name = "compatibility_audit"
+test = true

@@ -48,6 +48,10 @@ Options:
 
 ## What gets converted
 
+The table below describes the common conversion paths. The
+[Obsidian feature coverage matrix](docs/obsidian-feature-coverage.md) distinguishes
+supported features, partial conversions, source preservation, and missing support.
+
 | Obsidian | Logseq DB |
 | --- | --- |
 | Note | Page (title = file name). Duplicate names get the folder appended: `Index (Projects)` |
@@ -76,7 +80,7 @@ Options:
 | `==highlight==` | `^^highlight^^` |
 | Footnotes `[^1]`, `^[inline]` | Definitions are added to the blocks that reference them |
 | `%%comment%%` | Removed (unless `--keep-comments`) |
-| Links to missing notes | Empty page, like Obsidian creates on click |
+| Wikilinks to missing notes | Empty page, like Obsidian creates on click; missing Markdown links are not resolved |
 | Notes in the templates folder | Page with a `#Template` block; `{{date}}`, `{{time}}`, `{{title}}` become `<% today %>`, `<% time %>`, `<% current page %>` |
 | Bookmarks | Favorites (a bookmarked heading or block favorites its note; folder, search and URL bookmarks are skipped) |
 
@@ -87,9 +91,11 @@ Notes whose names collide with Logseq built-in pages (e.g. `Task`, `Tags`,
 same name would merge them into the built-in page. Attachments that no note
 links to are skipped.
 
-Not converted, as Logseq DB has no equivalent: a numbered list's start
-number, `![[Note]]` embeds inside a sentence (they become references), folders,
-Canvas and Bases files, and plugin syntax such as Dataview queries.
+Currently not preserved: a numbered list's start number, transclusion of
+`![[Note]]` embeds inside a sentence (they become references), folder hierarchy,
+Canvas/Bases semantics, and executable plugin syntax such as Dataview queries.
+Linked Canvas/Bases files may be copied as opaque assets. These are limitations
+of this converter; they do not establish that Logseq has no useful counterpart.
 
 ## How importing works
 
@@ -125,8 +131,18 @@ Canvas and Bases files, and plugin syntax such as Dataview queries.
 ## Development
 
 ```sh
-cargo test                                      # unit + fixture tests
-O2L_E2E=1 cargo test -- --ignored               # end-to-end import via the logseq CLI
+cargo test --locked --all-targets               # unit + fixture + documented-format tests
+cargo test --locked --test convert_fixture -- --ignored --test-threads=1
+                                               # isolated imports via the logseq CLI
+cargo run --locked --example compatibility_audit # format probes; exit 1 while gaps remain
+python3 scripts/coverage.py --e2e               # line coverage; needs matching LLVM tools
 ```
 
 `tests/fixtures/sample-vault` exercises most of the conversions above.
+The Logseq tests create temporary graph roots and support `O2L_LOGSEQ_BIN` for a
+custom CLI executable. They do not replace a graph in your normal Logseq root.
+
+See the [compatibility audit](docs/compatibility.md) for pinned upstream sources,
+feature coverage, remaining conversion gaps, actual DB import results, and
+measured code coverage. Local upstream checkouts live in `references/` and
+generated reports in `target/compatibility/`; both are ignored by Git.

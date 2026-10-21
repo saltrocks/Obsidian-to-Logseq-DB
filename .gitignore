@@ -1,3 +1,4 @@
 /target
 *.edn
 *-assets/
+/references/
