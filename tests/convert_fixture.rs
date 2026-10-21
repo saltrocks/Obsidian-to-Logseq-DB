@@ -7,6 +7,37 @@ use obsidian_to_logseq::vault::Vault;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample-vault");
 
+// Stop the worker even when a test assertion fails, before its temporary root
+// is deleted. Every test command specifies this root explicitly.
+struct WorkerCleanup<'a> {
+    bin: &'a str,
+    root: &'a Path,
+    graph: &'a str,
+}
+
+impl Drop for WorkerCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new(self.bin)
+            .arg("--root-dir")
+            .arg(self.root)
+            .args(["server", "stop", "--graph", self.graph])
+            .output();
+    }
+}
+
+fn cli_json(cmd: &mut Command) -> serde_json::Value {
+    let out = cmd.args(["--output", "json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["status"], "ok", "{json}");
+    json
+}
+
 fn convert_fixture(opts: impl FnOnce(&mut ConvertOptions)) -> (Conversion, String) {
     let mut vault = Vault::scan(Path::new(FIXTURE), &[]).unwrap();
     vault.load_daily_config(None, None).unwrap();
@@ -166,66 +197,137 @@ fn phases_cover_all_deferred_properties() {
 }
 
 /// Full import through the Logseq CLI. Run with
-/// `O2L_E2E=1 cargo test -- --ignored` when `logseq` is installed.
+/// `cargo test --test convert_fixture -- --ignored` when `logseq` is installed.
 #[test]
 #[ignore]
 fn imports_into_logseq() {
-    if std::env::var_os("O2L_E2E").is_none() {
-        return;
-    }
+    let root = tempfile::tempdir().unwrap();
+    let bin = std::env::var("O2L_LOGSEQ_BIN").unwrap_or_else(|_| "logseq".into());
+    let cli = || {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--root-dir").arg(root.path());
+        cmd
+    };
     let graph = "obsidian-to-logseq-e2e";
+    let _worker = WorkerCleanup {
+        bin: &bin,
+        root: root.path(),
+        graph,
+    };
     let status = Command::new(env!("CARGO_BIN_EXE_obsidian-to-logseq"))
-        .args([FIXTURE, "--graph", graph, "--replace"])
+        .args([
+            FIXTURE,
+            "--graph",
+            graph,
+            "--chunk-blocks",
+            "1",
+            "--logseq-bin",
+            &bin,
+        ])
+        .arg("--root-dir")
+        .arg(root.path())
         .status()
         .unwrap();
     assert!(status.success());
-    let out = Command::new("logseq")
-        .args(["graph", "validate", "--graph", graph, "--output", "json"])
-        .output()
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(json["status"], "ok", "{json}");
+    let json = cli_json(cli().args(["graph", "validate", "--graph", graph]));
     assert!(json["data"]["result"]["errors"].is_null(), "{json}");
-    let out = Command::new("logseq")
+    assert_eq!(
+        json["data"]["result"]["invalid-entity-ids"],
+        serde_json::json!([])
+    );
+    let out = cli()
         .args(["show", "--graph", graph, "--page", "Home"])
         .output()
         .unwrap();
+    assert!(out.status.success(), "{out:?}");
     let shown = String::from_utf8_lossy(&out.stdout);
     assert!(
         shown.contains("[the alpha project]([[Project Alpha]])"),
         "{shown}"
     );
     // Number properties aren't printed by `show`, so query the value.
-    let out = Command::new("logseq")
-        .args([
+    let json = cli_json(cli().args([
             "query",
             "--graph",
             graph,
-            "--output",
-            "json",
             "--query",
             "[:find ?v . :where [?p :block/title \"Home\"] [?p :user.property/rating ?r] [?r :logseq.property/value ?v]]",
-        ])
-        .output()
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ]));
     assert_eq!(json["data"]["result"], 5, "{json}");
     // A list property holding a single page link (applied in a property batch).
-    let out = Command::new("logseq")
-        .args([
+    let json = cli_json(cli().args([
             "query",
             "--graph",
             graph,
-            "--output",
-            "json",
             "--query",
             "[:find ?t . :where [?p :block/title \"Index (Projects)\"] [?p :user.property/related ?r] [?r :block/title ?t]]",
-        ])
-        .output()
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ]));
     assert_eq!(json["data"]["result"], "Home", "{json}");
-    let _ = Command::new("logseq")
-        .args(["graph", "remove", "--graph", graph])
-        .status();
+    let assets = root.path().join("graphs").join(graph).join("assets");
+    let paths: Vec<_> = std::fs::read_dir(assets)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(paths.len(), 2);
+    for (ext, name) in [("png", "diagram.png"), ("pdf", "spec.pdf")] {
+        let actual = paths
+            .iter()
+            .find(|p| p.extension().is_some_and(|x| x == ext))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(actual).unwrap(),
+            std::fs::read(Path::new(FIXTURE).join("attachments").join(name)).unwrap()
+        );
+    }
+}
+
+/// Exercise the serialized EDN reader as well as the direct Transit worker path.
+#[test]
+#[ignore]
+fn imports_serialized_edn_into_logseq() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = std::env::var("O2L_LOGSEQ_BIN").unwrap_or_else(|_| "logseq".into());
+    let graph = "obsidian-to-logseq-edn-e2e";
+    let _worker = WorkerCleanup {
+        bin: &bin,
+        root: root.path(),
+        graph,
+    };
+    let cli = || {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--root-dir").arg(root.path());
+        cmd
+    };
+    let (conv, edn) = convert_fixture(|_| {});
+    let input = root.path().join("fixture.edn");
+    std::fs::write(&input, edn).unwrap();
+    cli_json(cli().args(["graph", "create", "--graph", graph]));
+    cli_json(
+        cli()
+            .args([
+                "graph", "import", "--graph", graph, "--type", "edn", "--input",
+            ])
+            .arg(input),
+    );
+    let validation = cli_json(cli().args(["graph", "validate", "--graph", graph]));
+    assert!(
+        validation["data"]["result"]["errors"].is_null(),
+        "{validation}"
+    );
+    assert_eq!(
+        validation["data"]["result"]["invalid-entity-ids"],
+        serde_json::json!([])
+    );
+    // The CLI has historically reported success on rejected imports. Verify
+    // every sampled note UUID and a typed property in the resulting database.
+    for uuid in conv.sample_page_uuids {
+        let query = format!("[:find ?e . :where [?e :block/uuid #uuid \"{uuid}\"]]");
+        let value = cli_json(cli().args(["query", "--graph", graph, "--query", &query]));
+        assert!(value["data"]["result"].as_i64().is_some(), "{value}");
+    }
+    let value = cli_json(cli().args([
+        "query", "--graph", graph, "--query",
+        "[:find ?v . :where [?p :block/title \"Home\"] [?p :user.property/rating ?r] [?r :logseq.property/value ?v]]",
+    ]));
+    assert_eq!(value["data"]["result"], 5, "{value}");
 }
